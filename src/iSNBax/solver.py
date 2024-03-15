@@ -17,10 +17,10 @@ class dummy_term(diffrax.AbstractTerm):
     def prod(self, vf, control):
         return None
 
-def calc_minus_div_op(Nx,d):
+def calc_div_FicksLaw_op(Nx,d):
     """
     
-    Calculates matrix representation of - div d grad (x) operator
+    Calculates matrix representation of div ( - d grad (x)) operator
     
     """
     A = jnp.zeros(Nx)
@@ -37,6 +37,26 @@ def calc_minus_div_op(Nx,d):
 
     return lx.TridiagonalLinearOperator(A,B,C),A,B,C
 
+def divQ_to_Q(divQ,area):
+    """
+    
+    Convert from div Q to Q assuming zero flux boundary
+    N.B. input divQ is volume integral
+
+    """
+    Q = jnp.zeros_like(divQ)
+
+    def Qintegral(carry,divQi):
+        ix, Q_im1h = carry
+        Q_ip1h = (divQi+area[ix]*Q_im1h)/area[ix+1]
+        carry = ix+1,Q_ip1h
+        return carry,Q_ip1h
+
+    carry = 0, 0.0
+    _,Q = jax.lax.scan(Qintegral,carry,divQ)
+
+    return Q
+
 class iSNB_Solver(diffrax.AbstractSolver):
     """
     
@@ -45,7 +65,7 @@ class iSNB_Solver(diffrax.AbstractSolver):
     """
     term_structure = dummy_term
     interpolation_cls = diffrax.LocalLinearInterpolation
-    atol = 1e-2
+    atol = 1e-4
     rtol = 1e-3
     itermax = 1
 
@@ -59,7 +79,6 @@ class iSNB_Solver(diffrax.AbstractSolver):
         # Define variables that are static during iterative solve
         area, vol, delta_x  = args['area'],args['vol'],args['delta_x']
         Nx = vol.shape[0]
-        Ngrp = args['Ngrp']
         IdentityOperator = lx.DiagonalLinearOperator(jnp.ones(Nx))
 
         S, Cv = args['S'], args['Cv']
@@ -79,13 +98,13 @@ class iSNB_Solver(diffrax.AbstractSolver):
             return Te_new, div_Q_correction, iter, convergence_criterion
 
         def single_implicit_iteration(Te_km1,div_Q_correction):
-            kappae,thermal_mfp = calc_transport_coeffs(args['Z'],args['ne'],Te_km1)
+            kappae,thermal_mfp,effective_mfp = calc_transport_coeffs(args['Z'],args['ne'],Te_km1)
             # Conductivities on the faces
             ke_ghost = jnp.concatenate([kappae[:1],kappae,kappae[-1:]])
             ke_face = 0.5*(ke_ghost[:-1]+ke_ghost[1:])
             rate_e = area*ke_face/delta_x
             
-            SpitzerHarmQOperator,Ash,Bsh,Csh = calc_minus_div_op(Nx,rate_e)
+            SpitzerHarmQOperator,Ash,Bsh,Csh = calc_div_FicksLaw_op(Nx,rate_e)
 
             # Diagonal
             AD = δt*Ash/heat_capacity_e
@@ -98,7 +117,7 @@ class iSNB_Solver(diffrax.AbstractSolver):
 
             LocalHeatOperator = IdentityOperator + DiffusionOperator
 
-            vector = Te_0 + (δt / heat_capacity_e) * (S + div_Q_correction)
+            vector = Te_0 + (δt / heat_capacity_e) * (vol * S + div_Q_correction)
             
             Te_k = lx.linear_solve(LocalHeatOperator, vector).value
 
@@ -107,23 +126,24 @@ class iSNB_Solver(diffrax.AbstractSolver):
             scale = self.atol + self.rtol * max_Te
             convergence_criterion = jnp.any(diff > scale)
 
-            minusDivQsh = SpitzerHarmQOperator.mv(Te_k)
+            DivQsh = SpitzerHarmQOperator.mv(Te_k)
 
             minus_div_Q_nonlocal = jax.lax.cond(convergence_criterion,
-                                                calc_nonlocal_Q,
-                                                lambda x,y,z : jnp.zeros_like(x),
-                                                Te_k,kappae,thermal_mfp)
+                                                calc_nonlocal_divQ,
+                                                lambda x,y,z : div_Q_correction+DivQsh,
+                                                Te_k,kappae,effective_mfp)
 
-            div_Q_correction = minus_div_Q_nonlocal-minusDivQsh
+            div_Q_correction = -minus_div_Q_nonlocal+DivQsh
 
             return Te_k, div_Q_correction, convergence_criterion
         
-        def calc_nonlocal_Q(Te,kappae,thermal_mfp):
+        def calc_nonlocal_divQ(Te_k,kappae,mfp):
             """
             
             Calculate the non-local heat flow term, Eq. 10 of Cao et al.
             
             """
+
             # Can vmap over energy groups
             def calc_Hg_over_lambdag(eta_g,mfp_g):
                 """
@@ -138,66 +158,86 @@ class iSNB_Solver(diffrax.AbstractSolver):
                 ke_SNB_face = 0.5*(ke_ghost[:-1]+ke_ghost[1:])
                 rate_e_SNB = area*ke_SNB_face/delta_x
 
-                DivUgOperator,_,_,_ = calc_minus_div_op(Nx,rate_e_SNB)
+                DivUgOperator,_,_,_ = calc_div_FicksLaw_op(Nx,rate_e_SNB)
 
-                minusDivUg = DivUgOperator.mv(Te)
+                minusDivUg = DivUgOperator.mv(Te_k)
                 
                 # Mean free paths on the faces
                 mfp_ghost = jnp.concatenate([mfp_g[:1],mfp_g,mfp_g[-1:]])
                 mfp_SNB_face = 0.5*(mfp_ghost[:-1]+mfp_ghost[1:])
-                Hgdivcoeff = area*mfp_SNB_face/delta_x/3.0
+                Hgdivcoeff = area*(mfp_SNB_face/3.0)/delta_x
 
                 # Assemble system of Hg solve
-                HgDivOperator,_,_,_ = calc_minus_div_op(Nx,Hgdivcoeff)
+                HgDivOperator,_,_,_ = calc_div_FicksLaw_op(Nx,Hgdivcoeff)
 
                 HgOperator = lx.DiagonalLinearOperator(vol/mfp_g) + HgDivOperator
 
                 # Thomas Algorithm can be unstable, swap to LU
                 HgOperator = lx.MatrixLinearOperator(HgOperator.as_matrix())
 
-                # Hg = lx.linear_solve(HgOperator, minusDivUg).value
+                Hg = lx.linear_solve(HgOperator, minusDivUg).value
 
-                Hg = jnp.matmul(jnp.linalg.pinv(HgOperator.as_matrix(),rcond=1e-3),minusDivUg)
+                # Hg = jnp.matmul(jnp.linalg.pinv(HgOperator.as_matrix(),rcond=1e-5),minusDivUg)
 
-                return vol*Hg/mfp_g
+                return Hg/mfp_g
 
-            eta_g = calc_eta_grp(args['Egb'][:-1],args['Egb'][1:],Te)
+            eta_gs = calc_eta_grp(args['Egb'][:-1],args['Egb'][1:],Te_k)
             # Make sure sum to 1
-            norm_eta_g = jnp.sum(eta_g,axis=0)
+            norm_eta_g = jnp.sum(eta_gs,axis=0)
             norm_eta_g = jnp.where(norm_eta_g > 0, norm_eta_g, 1.0)
-            eta_g = eta_g/norm_eta_g[None,:]
+            eta_gs = eta_gs/norm_eta_g[None,:]
 
-            mfp_g = calc_mfp_grp(args['Egc'],Te,thermal_mfp)
-            # mfp_g = jnp.where(mfp_g > 1e-6, mfp_g, 1e-6)
-            # mfp_g = jnp.where(mfp_g < 1e-5, mfp_g, 1e-5)
-            # mfp_g = 10e-6*jnp.ones_like(mfp_g)
+            mfp_gs = calc_mfp_grp(args['Egc'],Te_k,mfp)
 
-            Hg_over_lambdag = jax.vmap(calc_Hg_over_lambdag,in_axes=(0,0),out_axes=0)(eta_g,mfp_g)
+            Hg_over_lambdag = jax.vmap(calc_Hg_over_lambdag,in_axes=(0,0),out_axes=0)(eta_gs,mfp_gs)
 
-            minus_div_Q_nonlocal = jnp.sum(Hg_over_lambdag,axis=0)
+            minus_div_Q_nonlocal = vol*jnp.sum(Hg_over_lambdag,axis=0)
 
             return minus_div_Q_nonlocal
 
-        Te_0 = y0
-        div_Q_correction = jnp.zeros(Nx)
-        Te_1, _, _, _ = jax.lax.while_loop(keep_iterating, SNB_iteration, (Te_0, div_Q_correction, 0, True))
+        def calc_nonlocal_Q(Te,divQ_difference):
+            kappae,_,_ = calc_transport_coeffs(args['Z'],args['ne'],Te)
+            # Conductivities on the faces
+            ke_ghost = jnp.concatenate([kappae[:1],kappae,kappae[-1:]])
+            ke_face = 0.5*(ke_ghost[:-1]+ke_ghost[1:])
+            rate_e = area*ke_face/delta_x
+            
+            SpitzerHarmQOperator,_,_,_ = calc_div_FicksLaw_op(Nx,rate_e)
 
-        Te_error = jnp.zeros_like(Te_0)
-        dense_info = dict(y0=Te_0, y1=Te_1)
+            DivQsh = SpitzerHarmQOperator.mv(Te)
+
+            div_Q_nonlocal = DivQsh+divQ_difference
+
+            Q_nonlocal = divQ_to_Q(div_Q_nonlocal,area)
+            
+            return Q_nonlocal
+
+        y = y0.reshape(Nx,2)
+        Te_0 = y[:,0]
+        div_Q_correction = jnp.zeros(Nx)
+        Te_1, div_Q_correction, _, _ = jax.lax.while_loop(keep_iterating, SNB_iteration, (Te_0, div_Q_correction, 0, True))
+        
+        Q_1 = calc_nonlocal_Q(Te_1,div_Q_correction)
+
+        y1 = jnp.column_stack([Te_1,Q_1]).flatten()
+
+        y_error = jnp.zeros_like(y0)
+        dense_info = dict(y0=y0, y1=y1)
 
         solver_state = None
         result = diffrax.RESULTS.successful
-        return Te_1, Te_error, dense_info, solver_state, result
+        return y1, y_error, dense_info, solver_state, result
     
     def func(self, terms, t0, y0, args):
         return None
     
-def solve_iSNB(y0, dt0, ts, args, max_steps = 1000000):
+def solve_iSNB(T0, dt0, ts, args, max_steps = 1000000):
     """
     
     Uses diffrax to integrate iSNB model in time
     
     """
+    y0 = jnp.column_stack([T0,jnp.zeros_like(T0)]).flatten()
     solution = diffrax.diffeqsolve(
             dummy_term(),
             solver=iSNB_Solver(),
@@ -210,7 +250,8 @@ def solve_iSNB(y0, dt0, ts, args, max_steps = 1000000):
             saveat=diffrax.SaveAt(ts=ts),
             max_steps=max_steps
         )
-    return solution.ys.reshape(ts.shape[0],args['vol'].shape[0])
+    ys = solution.ys.reshape(ts.shape[0],args['vol'].shape[0],2)
+    return ys[:,:,0],ys[:,:,1]
 
 # Assume batched axis is last axis
 BatchediSNBSolve = jax.vmap(solve_iSNB,in_axes=(-1,-1,-1,-1),out_axes=-1)
@@ -223,7 +264,7 @@ class SpitzerHarm_Solver(diffrax.AbstractSolver):
     """
     term_structure = dummy_term
     interpolation_cls = diffrax.LocalLinearInterpolation
-    atol = 1e-2
+    atol = 1e-4
     rtol = 1e-3
     itermax = 10
 
@@ -256,13 +297,13 @@ class SpitzerHarm_Solver(diffrax.AbstractSolver):
             return Te_new, iter, convergence_criterion
 
         def single_implicit_iteration(Te_km1):
-            kappae,_ = calc_transport_coeffs(args['Z'],args['ne'],Te_km1)
+            kappae,_,_ = calc_transport_coeffs(args['Z'],args['ne'],Te_km1)
             # Conductivities on the faces
             ke_ghost = jnp.concatenate([kappae[:1],kappae,kappae[-1:]])
             ke_face = 0.5*(ke_ghost[:-1]+ke_ghost[1:])
             rate_e = area*ke_face/delta_x
             
-            _,Ash,Bsh,Csh = calc_minus_div_op(Nx,rate_e)
+            _,Ash,Bsh,Csh = calc_div_FicksLaw_op(Nx,rate_e)
 
             # Diagonal
             AD = δt*Ash/heat_capacity_e
@@ -285,26 +326,47 @@ class SpitzerHarm_Solver(diffrax.AbstractSolver):
             convergence_criterion = jnp.any(diff > scale)
 
             return Te_k, convergence_criterion
+        
+        def calc_Qsh(Te):
+            kappae,_,_ = calc_transport_coeffs(args['Z'],args['ne'],Te)
+            # Conductivities on the faces
+            ke_ghost = jnp.concatenate([kappae[:1],kappae,kappae[-1:]])
+            ke_face = 0.5*(ke_ghost[:-1]+ke_ghost[1:])
+            rate_e = area*ke_face/delta_x
+            
+            SpitzerHarmQOperator,_,_,_ = calc_div_FicksLaw_op(Nx,rate_e)
 
-        Te_0 = y0
+            DivQsh = SpitzerHarmQOperator.mv(Te)
+
+            Q_sh = divQ_to_Q(DivQsh,area)
+            
+            return Q_sh
+        
+        y = y0.reshape(Nx,2)
+        Te_0 = y[:,0]
         Te_1, _, _ = jax.lax.while_loop(keep_iterating, SH_iteration, (Te_0, 0, True))
 
-        Te_error = jnp.zeros_like(Te_0)
-        dense_info = dict(y0=Te_0, y1=Te_1)
+        Q_1 = calc_Qsh(Te_1)
+
+        y1 = jnp.column_stack([Te_1,Q_1]).flatten()
+
+        y_error = jnp.zeros_like(y0)
+        dense_info = dict(y0=y0, y1=y1)
 
         solver_state = None
         result = diffrax.RESULTS.successful
-        return Te_1, Te_error, dense_info, solver_state, result
+        return y1, y_error, dense_info, solver_state, result
     
     def func(self, terms, t0, y0, args):
         return None
     
-def solve_SpitzerHarm(y0, dt0, ts, args, max_steps = 1000000):
+def solve_SpitzerHarm(T0, dt0, ts, args, max_steps = 1000000):
     """
     
     Uses diffrax to integrate iSNB model in time
     
     """
+    y0 = jnp.column_stack([T0,jnp.zeros_like(T0)]).flatten()
     solution = diffrax.diffeqsolve(
             dummy_term(),
             solver=SpitzerHarm_Solver(),
@@ -317,7 +379,8 @@ def solve_SpitzerHarm(y0, dt0, ts, args, max_steps = 1000000):
             saveat=diffrax.SaveAt(ts=ts),
             max_steps=max_steps
         )
-    return solution.ys.reshape(ts.shape[0],args['vol'].shape[0])
+    ys = solution.ys.reshape(ts.shape[0],args['vol'].shape[0],2)
+    return ys[:,:,0],ys[:,:,1]
 
 # Assume batched axis is last axis
 BatchedSpitzerHarmSolve = jax.vmap(solve_SpitzerHarm,in_axes=(-1,-1,-1,-1),out_axes=-1)
