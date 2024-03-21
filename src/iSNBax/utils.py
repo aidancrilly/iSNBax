@@ -5,7 +5,15 @@ import EpperleinHaines as EH
 from functools import partial
 
 class BetaIntegralInterp():
+    """
+    
+    Creates an interpolator on the integral
 
+    I(beta) = \int_{0}^{beta} x^4 exp( - x ) / 24
+
+    Used to compute Ug via eta_g = I(beta_g+1/2)-I(beta_g-1/2)
+    
+    """
     def __init__(self,beta_grid):
         self.beta_grid = beta_grid
         self.compute_cumulative_integral()
@@ -53,10 +61,12 @@ def assemble_args(geometry,xs,ni,Z,source_term,Ee_max,Ngrp):
     return args
 
 def calc_transport_coeffs(Z, ne, Te):
-    ln_lambda = calc_coloumb_log()
+    ln_lambda = calc_coloumb_log(Z,ne,Te)
     tau_e = calc_tau_e(Z, ne, Te, ln_lambda)
     kappa_e = EH.gamma0(Z)*ne*sc.e**2*Te*tau_e/(sc.m_e)
     mfp_ei = tau_e*jnp.sqrt(2*Te*sc.e/sc.m_e)
+    # Setting Coulomb log
+    ln_lambda = 7.09
     effective_mfp_e = SNB_effective_mfp_e(Z, ne, Te, ln_lambda)
     return kappa_e,mfp_ei,effective_mfp_e
 
@@ -65,10 +75,14 @@ def SNB_effective_mfp_e(Z, ne, Te, coulomb_log):
     return 3.8378e16 * Te**2 / ne / coulomb_log / jnp.sqrt(Z * phi)
 
 def calc_tau_e(Z, ne, Te, coulomb_log):
-    return 3.44e11 * Te**1.5 / ne / Z / coulomb_log
+    phi = (Z+4.2)/(Z+0.25)
+    return 3.44e11 * Te**1.5 / ne / coulomb_log / Z
 
-def calc_coloumb_log():
-    return 7.1
+def calc_coloumb_log(Z,ne,Te):
+    ne_cc = ne*1e-6
+    ln_lambda = jnp.where(Te < 10*Z**2, 23.0-jnp.log(jnp.sqrt(ne_cc)*Z/Te**1.5), 24.0-jnp.log(jnp.sqrt(ne_cc)/Te))
+    # NRL formulary Ti me/mi < 10 Z^2 eV < Te
+    return ln_lambda
 
 def calc_eta_grp(Eg_lower,Eg_upper,Te):
     beta_lower = Eg_lower[:,None]/Te[None,:]
